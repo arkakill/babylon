@@ -1,0 +1,72 @@
+name: F-02 late covenant quorum audit
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - audit/f-02-quorum-expiry-v4.5.0
+
+permissions:
+  contents: read
+
+jobs:
+  f02-targeted-tests:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout audit branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set up Go from go.mod
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Run control test
+        shell: bash
+        run: |
+          mkdir -p audit-results
+          command="go test -mod=readonly -tags='cgo ledger test_ledger_mock norace' -count=1 -v -run '^TestF02ControlQuorumBeforeExpiry$' ./x/finality/keeper"
+          printf '%s\n' "$command" > audit-results/control-command.txt
+          set +e
+          go test -mod=readonly -tags='cgo ledger test_ledger_mock norace' -count=1 -v -run '^TestF02ControlQuorumBeforeExpiry$' ./x/finality/keeper > audit-results/control.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > audit-results/control.exit-code
+          cat audit-results/control.log
+      - name: Run late-quorum target test
+        shell: bash
+        run: |
+          command="go test -mod=readonly -tags='cgo ledger test_ledger_mock norace' -count=1 -v -run '^TestF02LateQuorumAfterExpiryHasNoVotingPower$' ./x/finality/keeper"
+          printf '%s\n' "$command" > audit-results/target-command.txt
+          set +e
+          go test -mod=readonly -tags='cgo ledger test_ledger_mock norace' -count=1 -v -run '^TestF02LateQuorumAfterExpiryHasNoVotingPower$' ./x/finality/keeper > audit-results/target.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > audit-results/target.exit-code
+          cat audit-results/target.log
+      - name: Summarize test results
+        if: always()
+        shell: bash
+        run: |
+          control_result="$(cat audit-results/control.exit-code 2>/dev/null || echo not-run)"
+          target_result="$(cat audit-results/target.exit-code 2>/dev/null || echo not-run)"
+          {
+            echo "## F-02 late quorum audit"
+            echo
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Control exit code: $control_result"
+            echo "- Target exit code: $target_result"
+            echo "- Logs and exact commands are attached as workflow artifacts."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$control_result" != "0" || "$target_result" != "0" ]]; then
+            exit 1
+          fi
+      - name: Preserve test logs and exit codes
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: f02-audit-results
+          path: audit-results/
+          if-no-files-found: error
+          retention-days: 90
