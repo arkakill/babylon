@@ -126,18 +126,22 @@ func (f *f02AuditFixture) submitQuorum(t *testing.T) {
 func (f *f02AuditFixture) assertPersistedPower(t *testing.T, babylonHeight uint64, expected uint64) {
 	t.Helper()
 	cache := f.h.FinalityKeeper.GetVotingPowerDistCache(f.h.Ctx, babylonHeight)
-	require.NotNil(t, cache, "the distribution cache must be present in keeper storage")
-	require.Equal(t, expected, cache.TotalVotingPower)
-
 	table := f.h.FinalityKeeper.GetVotingPowerTable(f.h.Ctx, babylonHeight)
 	require.Equal(t, expected, f.h.FinalityKeeper.GetVotingPower(f.h.Ctx, f.fp.BtcPk.MustMarshal(), babylonHeight))
 	if expected == 0 {
-		require.Zero(t, cache.NumActiveFps)
-		require.Empty(t, cache.FinalityProviders)
+		// An empty protobuf cache marshals to no bytes and is therefore absent
+		// from the KV store. Treat absence as the persisted empty distribution.
+		if cache != nil {
+			require.Zero(t, cache.TotalVotingPower)
+			require.Zero(t, cache.NumActiveFps)
+			require.Empty(t, cache.FinalityProviders)
+		}
 		require.Empty(t, table)
 		return
 	}
 
+	require.NotNil(t, cache, "a non-empty distribution cache must be present in keeper storage")
+	require.Equal(t, expected, cache.TotalVotingPower)
 	require.Equal(t, uint32(1), cache.NumActiveFps)
 	require.Len(t, cache.FinalityProviders, 1)
 	require.Equal(t, expected, cache.FinalityProviders[0].TotalBondedSat)
@@ -172,7 +176,7 @@ func TestF02ControlQuorumBeforeExpiry(t *testing.T) {
 	require.Empty(t, f.h.BTCStakingKeeper.GetAllPowerDistUpdateEvents(f.h.Ctx, expiringHeight, expiringHeight))
 	t.Logf("control after expiry: state=%s BTC height=%d voting_power=0 cache=%s table=%v",
 		f.derivedStatus(t, expiringHeight), expiringHeight,
-		f.h.FinalityKeeper.GetVotingPowerDistCache(f.h.Ctx, 5).String(),
+		f.cacheSummary(5),
 		f.h.FinalityKeeper.GetVotingPowerTable(f.h.Ctx, 5))
 }
 
@@ -205,15 +209,21 @@ func TestF02LateQuorumAfterExpiryHasNoVotingPower(t *testing.T) {
 
 	f.beginBlock(6, expiringHeight+1)
 	cache := f.h.FinalityKeeper.GetVotingPowerDistCache(f.h.Ctx, 6)
-	require.NotNil(t, cache, "the distribution cache must be present in keeper storage")
 	table := f.h.FinalityKeeper.GetVotingPowerTable(f.h.Ctx, 6)
 	power := f.h.FinalityKeeper.GetVotingPower(f.h.Ctx, f.fp.BtcPk.MustMarshal(), 6)
-	require.Equal(t, power, cache.TotalVotingPower)
+	cachePower := uint64(0)
+	if cache != nil {
+		cachePower = cache.TotalVotingPower
+	}
+	require.Equal(t, power, cachePower)
 	if power == 0 {
-		require.Zero(t, cache.NumActiveFps)
-		require.Empty(t, cache.FinalityProviders)
+		if cache != nil {
+			require.Zero(t, cache.NumActiveFps)
+			require.Empty(t, cache.FinalityProviders)
+		}
 		require.Empty(t, table)
 	} else {
+		require.NotNil(t, cache, "a non-empty distribution cache must be present in keeper storage")
 		require.Equal(t, uint32(1), cache.NumActiveFps)
 		require.Len(t, cache.FinalityProviders, 1)
 		require.Equal(t, power, cache.FinalityProviders[0].TotalBondedSat)
@@ -222,9 +232,17 @@ func TestF02LateQuorumAfterExpiryHasNoVotingPower(t *testing.T) {
 	}
 
 	t.Logf("after late quorum: derived_state=%s BTC height=%d voting_power=%d cache=%s table=%v",
-		f.derivedStatus(t, expiringHeight+1), expiringHeight+1, power, cache.String(), table)
+		f.derivedStatus(t, expiringHeight+1), expiringHeight+1, power, f.cacheSummary(6), table)
 
 	// Security invariant: the expired delegation must not be reintroduced to
 	// the voting-power distribution after its EXPIRED event was consumed.
-	require.Zero(t, power, "expired delegation regained voting power; cache=%s table=%v", cache.String(), table)
+	require.Zero(t, power, "expired delegation regained voting power; cache=%s table=%v", f.cacheSummary(6), table)
+}
+
+func (f *f02AuditFixture) cacheSummary(babylonHeight uint64) string {
+	cache := f.h.FinalityKeeper.GetVotingPowerDistCache(f.h.Ctx, babylonHeight)
+	if cache == nil {
+		return "<absent: empty serialized distribution>"
+	}
+	return cache.String()
 }
