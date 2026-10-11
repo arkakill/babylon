@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout audit branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
       - name: Set up Go from go.mod
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
@@ -26,9 +28,11 @@ jobs:
         run: |
           mkdir -p audit-results
           printf '%s\n' "$(git rev-parse HEAD)" > audit-results/audit-commit.sha
-          printf '%s\n' "$(git merge-base HEAD c2f731f4531b2b22afe5047f152e108b944bf811)" > audit-results/upstream-base.sha
+          upstream_base="$(git merge-base HEAD c2f731f4531b2b22afe5047f152e108b944bf811)"
+          test "$upstream_base" = "c2f731f4531b2b22afe5047f152e108b944bf811"
+          printf '%s\n' "$upstream_base" > audit-results/upstream-base.sha
           printf '%s\n' "$(git status --short --branch)" > audit-results/git-status.txt
-          printf '%s\n' "$(git diff --name-only c2f731f4531b2b22afe5047f152e108b944bf811 HEAD)" > audit-results/audit-commit-files.txt
+          printf '%s\n' "$(git diff --name-only "$upstream_base" HEAD)" > audit-results/audit-commit-files.txt
           go version | tee audit-results/go-version.txt
           go env GOVERSION GOTOOLCHAIN GOOS GOARCH CGO_ENABLED | tee audit-results/go-env.txt
       - name: Run control test
