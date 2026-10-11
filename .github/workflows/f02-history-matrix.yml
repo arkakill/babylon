@@ -1,0 +1,158 @@
+name: F-02 historical revision matrix
+on:
+  push:
+    branches:
+      - audit/f02-history-reconstruction
+permissions:
+  contents: read
+jobs:
+  f02-history:
+    name: '${{ matrix.case_id }} — ${{ matrix.sha }}'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - case_id: pr631-parent
+            reference: https://github.com/babylonlabs-io/babylon/pull/631
+            sha: cbc3a9a8c0c1e143f44f819dc145051dabf0f122
+          - case_id: pr631-fix
+            reference: https://github.com/babylonlabs-io/babylon/pull/631
+            sha: 6d9b66816d33bd5bbb2abc9a55eb29324d836715
+          - case_id: pr634-backport-parent
+            reference: https://github.com/babylonlabs-io/babylon/pull/634
+            sha: b68ef264564cfb01dd0d270076cec4055f3d1c6d
+          - case_id: pr634-backport-fix
+            reference: https://github.com/babylonlabs-io/babylon/pull/634
+            sha: 1ebc3727fba1bf6231cb11d70554b12fa58d2342
+          - case_id: v4.5.0
+            reference: https://github.com/babylonlabs-io/babylon/releases/tag/v4.5.0
+            sha: f9006e4232dece8050b08556c4617bc0aaa07128
+          - case_id: upstream-main-c2f731f
+            reference: https://github.com/babylonlabs-io/babylon/commit/c2f731f4531b2b22afe5047f152e108b944bf811
+            sha: c2f731f4531b2b22afe5047f152e108b944bf811
+    steps:
+      - name: Checkout the audit test source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: arkakill/babylon
+          ref: ${{ github.sha }}
+          path: audit-source
+          fetch-depth: 1
+      - name: Checkout the exact historical revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: arkakill/babylon
+          ref: ${{ matrix.sha }}
+          path: tested
+          fetch-depth: 1
+      - name: Use Go version declared by the tested revision
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: tested/go.mod
+          cache: true
+          cache-dependency-path: tested/go.sum
+      - name: Record exact revisions and copy the unchanged test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p audit-results
+          git -C audit-source rev-parse HEAD > audit-results/audit-source-commit.sha
+          tested_sha=$(git -C tested rev-parse HEAD)
+          test "$tested_sha" = "${{ matrix.sha }}"
+          printf '%s\n' "$tested_sha" > audit-results/tested-commit.sha
+          git -C tested show -s --format='%P' > audit-results/tested-parent.sha
+          printf '%s\n' '${{ matrix.case_id }}' > audit-results/case.txt
+          printf '%s\n' '${{ matrix.reference }}' > audit-results/historical-reference.txt
+          go version > audit-results/go-version.txt
+          go env GOVERSION GOTOOLCHAIN GOOS GOARCH CGO_ENABLED > audit-results/go-env.txt
+          cp audit-source/x/finality/keeper/f02_late_quorum_audit_test.go tested/x/finality/keeper/f02_late_quorum_audit_test.go
+          sha256sum audit-source/x/finality/keeper/f02_late_quorum_audit_test.go | awk '{print $1}' > audit-results/test-source.sha256
+          target_module=$(awk '$1 == "module" {print $2; exit}' tested/go.mod)
+          printf '%s\n' "$target_module" > audit-results/module-path.txt
+          test_file=tested/x/finality/keeper/f02_late_quorum_audit_test.go
+          if [[ "$target_module" != github.com/babylonlabs-io/babylon/v4 ]]; then
+            TARGET_MODULE="$target_module" python3 - "$test_file" <<'PY'
+          from pathlib import Path
+          import os, sys
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          text = text.replace('github.com/babylonlabs-io/babylon/v4', os.environ['TARGET_MODULE'])
+          path.write_text(text)
+          PY
+            printf '%s\n' 'Only module import prefixes were adapted; test logic and assertions are unchanged.' > audit-results/test-adaptation.txt
+          else
+            printf '%s\n' 'No source adaptation required.' > audit-results/test-adaptation.txt
+          fi
+          sha256sum "$test_file" | awk '{print $1}' > audit-results/test-adapted.sha256
+          diff -u audit-source/x/finality/keeper/f02_late_quorum_audit_test.go "$test_file" > audit-results/test-adaptation.diff || true
+          git -C tested status --short > audit-results/test-only-working-tree.txt
+          cat > audit-results/control-command.txt <<'EOF'
+          go test -mod=readonly -tags='cgo ledger test_ledger_mock norace' -count=1 -v -run '^TestF02ControlQuorumBeforeExpiry$' ./x/finality/keeper
+          EOF
+          cat > audit-results/target-command.txt <<'EOF'
+          go test -mod=readonly -tags='cgo ledger test_ledger_mock norace' -count=1 -v -run '^TestF02LateQuorumAfterExpiryHasNoVotingPower$' ./x/finality/keeper
+          EOF
+      - name: Run control and target separately and preserve full logs
+        shell: bash
+        run: |
+          set +e
+          (cd tested && go test -mod=readonly -tags='cgo ledger test_ledger_mock norace' -count=1 -v -run '^TestF02ControlQuorumBeforeExpiry$' ./x/finality/keeper) > audit-results/control.log 2>&1
+          control_rc=$?
+          (cd tested && go test -mod=readonly -tags='cgo ledger test_ledger_mock norace' -count=1 -v -run '^TestF02LateQuorumAfterExpiryHasNoVotingPower$' ./x/finality/keeper) > audit-results/target.log 2>&1
+          target_rc=$?
+          printf '%s\n' "$control_rc" > audit-results/control.exit-code
+          printf '%s\n' "$target_rc" > audit-results/target.exit-code
+          if [[ $control_rc -eq 0 ]] && grep -Fq -- '--- PASS: TestF02ControlQuorumBeforeExpiry' audit-results/control.log; then control_result=PASS; else control_result=FAIL_OR_BLOCKED; fi
+          if grep -Fq 'expired delegation regained voting power' audit-results/target.log; then
+            target_result=F02_REPRODUCED_AT_FINAL_INVARIANT
+            final_assertion=REACHED_AND_FAILED
+          elif [[ $target_rc -eq 0 ]] && grep -Fq -- '--- PASS: TestF02LateQuorumAfterExpiryHasNoVotingPower' audit-results/target.log; then
+            target_result=TARGET_INVARIANT_PASSED
+            final_assertion=REACHED_AND_PASSED
+          else
+            target_result=FAILED_BEFORE_FINAL_INVARIANT_OR_COMPILE
+            final_assertion=NOT_VERIFIED
+          fi
+          printf '%s\n' "$control_result" > audit-results/control-result.txt
+          printf '%s\n' "$target_result" > audit-results/target-result.txt
+          printf '%s\n' "$final_assertion" > audit-results/final-assertion.txt
+          grep -E 'control before expiry|control after expiry|after EXPIRED event without quorum|after late quorum|Should be zero|expired delegation regained voting power|undefined:|FAIL|PASS' audit-results/control.log audit-results/target.log > audit-results/observed-state-lines.txt || true
+          cat audit-results/control.log
+          cat audit-results/target.log
+      - name: Summarize this historical revision
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p audit-results
+          control_result=$(cat audit-results/control-result.txt 2>/dev/null || echo NOT_RUN)
+          target_result=$(cat audit-results/target-result.txt 2>/dev/null || echo NOT_RUN)
+          control_rc=$(cat audit-results/control.exit-code 2>/dev/null || echo not-run)
+          target_rc=$(cat audit-results/target.exit-code 2>/dev/null || echo not-run)
+          tested_sha=$(cat audit-results/tested-commit.sha 2>/dev/null || echo unavailable)
+          tested_parent=$(cat audit-results/tested-parent.sha 2>/dev/null || echo unavailable)
+          go_version=$(cat audit-results/go-version.txt 2>/dev/null || echo unavailable)
+          final_assertion=$(cat audit-results/final-assertion.txt 2>/dev/null || echo NOT_VERIFIED)
+          {
+            echo '## F-02 historical case'
+            echo
+            echo '- Case: ${{ matrix.case_id }}'
+            echo '- Historical reference: ${{ matrix.reference }}'
+            echo "- Tested SHA: $tested_sha"
+            echo "- Parent SHA(s): $tested_parent"
+            echo "- Go: $go_version"
+            echo "- Control: $control_result (exit $control_rc)"
+            echo "- Target: $target_result (exit $target_rc)"
+            echo "- Final assertion: $final_assertion"
+            echo '- Full logs, exact commands, hashes, state lines, and metadata are attached as an artifact.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve logs and metadata
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: f02-history-${{ matrix.case_id }}
+          path: audit-results/
+          if-no-files-found: warn
+          retention-days: 90
